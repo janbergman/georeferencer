@@ -9,7 +9,7 @@
 * om felet RMSE är midre än 10 meter så borde orinteringskartan vara väl inpassad.<br>
 <br>
 * man kan lägga på ett .gpx spår om man vill se hur man sprungit<br>
-* man kan exportera till .kmz för att kunna titta på kartan i Googgle Earth eller ladda upp till Iphone appen Orienteering Companion för att lägga en egen bana för träning.<br>
+* man kan exportera till .kmz för att kunna titta på kartan i Googgle Earth eller ladda upp till Iphone appen Orienteering Companion för att lägga en egen bana för träning.<br><br>
 
 https://janbergman.github.io/georeferencer/<br>
 this program was vibe coded with OpenAIs Codex CLI (about 20 interations)
