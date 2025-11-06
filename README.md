@@ -12,3 +12,4 @@
 * man kan exportera till .kmz för att kunna titta på kartan i Googgle Earth eller ladda upp till Iphone appen Orienteering Companion för att lägga en egen bana för träning.<br>
 
 https://janbergman.github.io/georeferencer/
+this program was vibe coded with OpenAIs Codex CLI (about 20 interations)
