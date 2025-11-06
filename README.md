@@ -10,3 +10,5 @@
 <br>
 * man kan lägga på ett .gpx spår om man vill se hur man sprungit<br>
 * man kan exportera till .kmz för att kunna titta på kartan i Googgle Earth eller ladda upp till Iphone appen Orienteering Companion för att lägga en egen bana för träning.<br>
+
+https://janbergman.github.io/georeferencer/
