@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Map Georeferencer v2.2</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root { --bg:#0b0c10; --panel:#11131a; --ink:#e8e8ea; --muted:#9aa0a6; --accent:#1a4e85; }
+    * { box-sizing: border-box; }
+    html, body { height:100%; margin:0; }
+    body { display:flex; flex-direction:column; background:var(--bg); color:var(--ink); font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial; }
+    header { flex:0 0 auto; padding:10px 12px; background:var(--panel); border-bottom:1px solid #222; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    header h1 { margin:0; font-size:16px; font-weight:600; }
+    label { font-size:12px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+    input[type=file], input[type=range], select, button { background:#0f1420; color:var(--ink); border:1px solid #2a2f3a; border-radius:8px; padding:6px 8px; font:inherit; }
+    input[type=range] { padding:0; }
+    button { cursor:pointer; background:#10233a; border-color:#22476e; }
+    button.primary { background:var(--accent); }
+    main { flex:1 1 auto; min-height:0; display:grid; grid-template-columns:1fr 1fr; gap:0; }
+    #image-panel, #map-panel { position:relative; }
+    #image-canvas, #map { position:absolute; inset:0; width:100%; height:100%; display:block; }
+    #sidebar { grid-column:1/-1; display:flex; gap:12px; padding:8px 12px; background:var(--panel); border-top:1px solid #222; align-items:center; }
+    #points { flex:1; max-height:28vh; overflow:auto; background:#0f1420; border:1px solid #23293a; border-radius:8px; padding:8px; }
+    #points .row { font:12px ui-monospace,Menlo,Consolas,monospace; padding:3px 4px; border-bottom:1px dashed #222; }
+    #points .row:last-child{ border-bottom:none; }
+    .badge { background:#18243a; border:1px solid #2b4f7a; padding:2px 6px; border-radius:999px; font-size:11px; }
+    .map-crosshair, .map-crosshair * { cursor: crosshair !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Map Georeferencer</h1>
+    <label>Map image <input type="file" id="image-loader" accept="image/*"></label>
+    <button id="start-calib" class="primary">Start calibration</button>
+    <label>Reference
+      <select id="basemap-select">
+        <option value="satellite" selected>Satellite</option>
+        <option value="street">Street map</option>
+      </select>
+    </label>
+    <button id="add-point" class="primary">Add control point</button>
+    <button id="clear-points">Clear points</button>
+    <button id="remove-worst">Remove worst point</button>
+    <label>GPX track <input type="file" id="gpx-loader" accept=".gpx"></label>
+    <button id="clear-gpx">Clear GPX</button>
+    <button id="export-kmz" class="primary">Export KMZ</button>
+    <label><input type="checkbox" id="show-overlay" checked> Show overlay</label>
+    <label>Opacity <input type="range" id="overlay-opacity" min="0" max="1" step="0.05" value="1"></label>
+    <span id="crs-badge" class="badge">SWEREF 99 TM</span>
+    <span id="calib-status" class="badge">Load an image</span>
+    <span id="rmse" class="badge">RMSE: -</span>
+  </header>
+
+  <main>
+    <section id="image-panel"><canvas id="image-canvas"></canvas></section>
+    <section id="map-panel"><div id="map"></div></section>
+  </main>
+
+  <section id="sidebar"><div id="points"></div></section>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/11.11.0/math.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.2/proj4.min.js"></script>
+  <script>
+    // --- Element refs ---
+    var imageLoader = document.getElementById('image-loader');
+    var canvas = document.getElementById('image-canvas');
+    var ctx = canvas.getContext('2d');
+    var pointsDiv = document.getElementById('points');
+    var rmseEl = document.getElementById('rmse');
+    var addBtn = document.getElementById('add-point');
+    var clearBtn = document.getElementById('clear-points');
+    var removeWorstBtn = document.getElementById('remove-worst');
+    var exportBtn = document.getElementById('export-kmz');
+    var startCalibBtn = document.getElementById('start-calib');
+    var calibStatus = document.getElementById('calib-status');
+    var overlayOpacity = document.getElementById('overlay-opacity');
+    var showOverlayChk = document.getElementById('show-overlay');
+    var gpxLoader = document.getElementById('gpx-loader');
+    var gpxClear = document.getElementById('clear-gpx');
+    var basemapSel = document.getElementById('basemap-select');
+
+    // --- Leaflet map ---
+    var map = L.map('map', { preferCanvas: true }).setView([59.3293,18.0686], 12);
+    var satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 20,
+      attribution: 'Tiles (c) Esri'
+    });
+    var streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap contributors'
+    });
+    var currentBase=null;
+    function setBase(which){
+      var next=(which==='street')? streetLayer : satelliteLayer;
+      if(currentBase===next) return;
+      if(currentBase){ try{ map.removeLayer(currentBase); }catch(e){} }
+      currentBase=next;
+      currentBase.addTo(map);
+    }
+    setBase(basemapSel? basemapSel.value : 'satellite');
+    var mapContainer = map.getContainer();
+    function setMapCrosshair(active){
+      if(!mapContainer) return;
+      if(active){
+        mapContainer.classList.add('map-crosshair');
+        try{ map.dragging.disable(); }catch(e){}
+        try{ map.doubleClickZoom.disable(); }catch(e){}
+      }else{
+        mapContainer.classList.remove('map-crosshair');
+        try{ map.dragging.enable(); }catch(e){}
+        try{ map.doubleClickZoom.enable(); }catch(e){}
+      }
+    }
+    if(basemapSel){
+      basemapSel.addEventListener('change', function(){ setBase(basemapSel.value); });
+    }
+
+    var imagePane = map.createPane('mapImagePane');
+    imagePane.style.zIndex = '200';
+    setTimeout(function(){ try { map.invalidateSize(); } catch(e){} }, 0);
+    window.addEventListener('resize', function(){ try { map.invalidateSize(); } catch(e){} });
+
+    // --- State ---
+    var image=null, overlay=null;
+    var scale=1, tx=0, ty=0, pan=false, lastX=0, lastY=0;
+    var controlPoints=[];
+    var awaitingImageClick=false, tempImg=null;
+    var lastResiduals=[];
+    var lastCornersForKmz=null;
+    var gpxPolyline=null;
+
+    var SWEREF_3006_DEF = '+proj=tmerc +lat_0=0 +lon_0=15 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs';
+
+    function isProj4Ready(){ return typeof proj4 === 'function'; }
+
+    // --- Canvas sizing ---
+    function resize(){
+      var p = document.getElementById('image-panel');
+      canvas.width = p.clientWidth;
+      canvas.height = p.clientHeight;
+      draw();
+      if (overlay && typeof overlay._reset === 'function') overlay._reset();
+    }
+    window.addEventListener('resize', resize);
+
+    // --- Draw image + points ---
+    function draw(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if (!image) return;
+      ctx.save();
+      ctx.translate(tx,ty);
+      ctx.scale(scale,scale);
+      ctx.drawImage(image,0,0);
+      ctx.fillStyle='#ff5555';
+      for(var i=0;i<controlPoints.length;i++){
+        var p=controlPoints[i];
+        ctx.beginPath();
+        ctx.arc(p.img.x,p.img.y, 5/scale, 0, Math.PI*2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    canvas.addEventListener('wheel', function(e){
+      if (!image) return; e.preventDefault();
+      var factor=1.1;
+      var rect=canvas.getBoundingClientRect();
+      var mx=e.clientX-rect.left, my=e.clientY-rect.top;
+      var preX=(mx-tx)/scale, preY=(my-ty)/scale;
+      scale *= (e.deltaY<0?factor:1/factor);
+      tx = mx - preX*scale;
+      ty = my - preY*scale;
+      draw();
+    }, {passive:false});
+    canvas.addEventListener('mousedown', function(e){ pan=true; lastX=e.clientX; lastY=e.clientY; });
+    window.addEventListener('mouseup', function(){ pan=false; });
+    window.addEventListener('mousemove', function(e){
+      if(!pan) return;
+      tx+=e.clientX-lastX;
+      ty+=e.clientY-lastY;
+      lastX=e.clientX;
+      lastY=e.clientY;
+      draw();
+    });
+
+    // --- Projection helpers ---
+    function toProj(ll){
+      if(!isProj4Ready()) return {x:ll.lng, y:ll.lat};
+      try{ var xy=proj4(SWEREF_3006_DEF,[ll.lng,ll.lat]); return {x:xy[0], y:xy[1]}; }
+      catch(e){ return {x:ll.lng, y:ll.lat}; }
+    }
+    function fromProj(xy){
+      if(!isProj4Ready()) return L.latLng(xy.y, xy.x);
+      try{
+        var lonlat=proj4(SWEREF_3006_DEF, proj4.WGS84, [xy.x,xy.y]);
+        return L.latLng(lonlat[1], lonlat[0]);
+      }catch(e){
+        return L.latLng(xy.y, xy.x);
+      }
+    }
+
+    // --- Models ---
+    function fitSimilarity(src,dst){
+      var rows=[], rhs=[];
+      for(var i=0;i<src.length;i++){
+        var x=src[i][0], y=src[i][1], X=dst[i][0], Y=dst[i][1];
+        rows.push([x,-y,1,0]); rhs.push(X);
+        rows.push([y,x,0,1]); rhs.push(Y);
+      }
+      var A=math.matrix(rows), b=math.matrix(rhs), At=math.transpose(A);
+      var sol=math.lusolve(math.multiply(At,A), math.multiply(At,b)).valueOf().flat();
+      var sc=sol[0], ss=sol[1], tx0=sol[2], ty0=sol[3];
+      return {
+        apply:function(pt){
+          var x=pt[0], y=pt[1];
+          return [sc*x-ss*y+tx0, ss*x+sc*y+ty0];
+        }
+      };
+    }
+    function imgToCartesian(x,y){
+      return [x, image ? (image.height - y) : y];
+    }
+
+    function computeModel(){
+      if(controlPoints.length < 3) return null;
+      var src=controlPoints.map(function(p){ return imgToCartesian(p.img.x,p.img.y); });
+      var dst=controlPoints.map(function(p){ return [p.prj.x,p.prj.y]; });
+      return fitSimilarity(src,dst);
+    }
+
+    // --- Overlay layer (projective CSS) ---
+    var DistortedImageOverlay = L.Layer.extend({
+      initialize: function(url,corners){ this._url=url; this._corners=corners||[]; },
+      onAdd: function(map){
+        this._map=map;
+        if(!this._img){
+          this._img=L.DomUtil.create('img','leaflet-image-layer leaflet-zoom-animated');
+          this._img.src=this._url;
+          this._img.style.position='absolute';
+          this._img.style.transformOrigin='0 0';
+          this._img.style.pointerEvents='none';
+          this._img.style.willChange='transform';
+          this._img.style.opacity = overlayOpacity.value;
+        }
+        (map.getPane('mapImagePane')||map.getPanes().overlayPane).appendChild(this._img);
+        map.on('zoom zoomend move moveend viewreset', this._reset, this);
+        this._reset();
+      },
+      onRemove: function(map){
+        map.off('zoom zoomend move moveend viewreset', this._reset, this);
+        if (this._img) this._img.remove();
+        this._map=null;
+      },
+      setCorners: function(c){ this._corners=c||[]; this._reset(); },
+      _reset: function(){
+        if(!this._map||!this._img) return;
+        if(!this._corners||this._corners.length!==4){ this._img.style.display='none'; return; }
+        if(!this._img.complete){ var self=this; this._img.onload=function(){ self._reset(); }; return; }
+        this._img.style.display='';
+        var pts=this._corners.map(this._map.latLngToLayerPoint, this._map);
+        var w=this._img.naturalWidth, h=this._img.naturalHeight;
+        var src=[[0,0],[w,0],[w,h],[0,h]];
+        var dst=pts.map(function(p){ return [p.x,p.y]; });
+        var H=homography(src,dst);
+        var m=[ H[0][0],H[1][0],0,H[2][0],  H[0][1],H[1][1],0,H[2][1],  0,0,1,0,  H[0][2],H[1][2],0,H[2][2] ];
+        L.DomUtil.setPosition(this._img, L.point(0,0));
+        this._img.style.transform='matrix3d('+m.join(',')+')';
+      }
+    });
+
+    function homography(from,to){
+      var rows=[],vals=[];
+      for(var i=0;i<4;i++){
+        var x=from[i][0], y=from[i][1], u=to[i][0], v=to[i][1];
+        rows.push([x,y,1,0,0,0,-x*u,-y*u]); vals.push(u);
+        rows.push([0,0,0,x,y,1,-x*v,-y*v]); vals.push(v);
+      }
+      var A=math.matrix(rows), b=math.matrix(vals), At=math.transpose(A);
+      var sol=math.lusolve(math.multiply(At,A), math.multiply(At,b)).valueOf().flat();
+      var a=sol[0],b1=sol[1],c=sol[2],d=sol[3],e=sol[4],f=sol[5],g=sol[6],h=sol[7];
+      return [[a,b1,c],[d,e,f],[g,h,1]];
+    }
+
+    function ensureOverlay(){
+      if(!overlay){
+        overlay = new DistortedImageOverlay((image ? image.src : ''), []);
+        overlay.addTo(map);
+      }
+    }
+
+    function projectCorners(model){
+      if(!image) return null;
+      function toLatLng(x,y){
+        var out=model.apply(imgToCartesian(x,y));
+        return fromProj({x:out[0], y:out[1]});
+      }
+      var topLeft     = toLatLng(0,0);
+      var topRight    = toLatLng(image.width,0);
+      var bottomRight = toLatLng(image.width,image.height);
+      var bottomLeft  = toLatLng(0,image.height);
+      return {
+        overlay:[topLeft, topRight, bottomRight, bottomLeft],
+        kmz:[bottomLeft, bottomRight, topRight, topLeft]
+      };
+    }
+
+    // --- Update model/overlay ---
+    function updateOverlay(){
+      if(!image){
+        rmseEl.textContent='RMSE: -';
+        calibStatus.textContent='Load an image';
+        lastCornersForKmz=null;
+        if(overlay) overlay.setCorners(null);
+        return;
+      }
+      var model=computeModel();
+      if(!model){
+        rmseEl.textContent='RMSE: -';
+        calibStatus.textContent='Add >=3 points';
+        lastCornersForKmz=null;
+        if(overlay) overlay.setCorners(null);
+        renderPointList();
+        return;
+      }
+
+      var res=controlPoints.map(function(p){
+        var out=model.apply(imgToCartesian(p.img.x,p.img.y));
+        return Math.hypot(out[0]-p.prj.x, out[1]-p.prj.y);
+      });
+      lastResiduals=res;
+      var rmse=Math.sqrt(res.reduce(function(a,b){return a+b*b;},0)/res.length);
+      rmseEl.textContent='RMSE: '+(rmse>=100? rmse.toFixed(1) : rmse.toFixed(2))+' m';
+      calibStatus.textContent='Calibrated with '+controlPoints.length+' points';
+
+      var cornerSets = projectCorners(model);
+      lastCornersForKmz = cornerSets ? cornerSets.kmz : null;
+      if(!cornerSets){
+        if(overlay) overlay.setCorners(null);
+        renderPointList(res);
+        return;
+      }
+
+      if(!showOverlayChk.checked || awaitingImageClick){
+        if(overlay) overlay.setCorners(null);
+        renderPointList(res);
+        return;
+      }
+
+      ensureOverlay();
+      if(overlay && overlay._img){
+        overlay._img.src = image.src;
+        overlay._img.style.opacity = overlayOpacity.value;
+      }
+      overlay.setCorners(cornerSets.overlay);
+      if (gpxPolyline) { try { gpxPolyline.bringToFront(); } catch(e){} }
+      renderPointList(res);
+    }
+
+    // --- Controls ---
+    function beginAddPoint(){
+      if(!image) return;
+      awaitingImageClick=true;
+      addBtn.disabled=true;
+      addBtn.textContent='Click image...';
+      calibStatus.textContent='Step 1: click the scanned map';
+    }
+    addBtn.addEventListener('click', beginAddPoint);
+    startCalibBtn.addEventListener('click', beginAddPoint);
+
+    canvas.addEventListener('click', function(e){
+      if(!awaitingImageClick) return;
+      var rect=canvas.getBoundingClientRect();
+      var x=(e.clientX-rect.left - tx)/scale;
+      var y=(e.clientY-rect.top  - ty)/scale;
+      tempImg={x:x,y:y};
+      addBtn.textContent='Click reference map...';
+      calibStatus.textContent='Step 2: click the same spot on the map';
+      setMapCrosshair(true);
+    });
+
+    map.on('click', function(e){
+      if(!awaitingImageClick || !tempImg) return;
+      var ll=e.latlng;
+      var prj=toProj(ll);
+      controlPoints.push({img:tempImg,ll:ll,prj:prj});
+      tempImg=null;
+      awaitingImageClick=false;
+      addBtn.disabled=false;
+      addBtn.textContent='Add control point';
+      calibStatus.textContent='Added #'+controlPoints.length;
+      setMapCrosshair(false);
+      renderPointList();
+      draw();
+      updateOverlay();
+    });
+
+    clearBtn.addEventListener('click', function(){
+      controlPoints.length=0;
+      lastResiduals=[];
+      lastCornersForKmz=null;
+      awaitingImageClick=false;
+      tempImg=null;
+      addBtn.disabled=false;
+      addBtn.textContent='Add control point';
+      calibStatus.textContent='Ready';
+      setMapCrosshair(false);
+      renderPointList();
+      draw();
+      updateOverlay();
+    });
+
+    removeWorstBtn.addEventListener('click', function(){
+      if(!lastResiduals.length) return;
+      var maxI=0;
+      for(var i=1;i<lastResiduals.length;i++){
+        if(lastResiduals[i]>lastResiduals[maxI]) maxI=i;
+      }
+      controlPoints.splice(maxI,1);
+      renderPointList();
+      updateOverlay();
+    });
+
+    showOverlayChk.addEventListener('change', updateOverlay);
+    overlayOpacity.addEventListener('input', function(){
+      if(overlay && overlay._img){ overlay._img.style.opacity = overlayOpacity.value; }
+    });
+
+    // --- GPX ---
+    function parseGpx(text){
+      try{
+        var xml=new DOMParser().parseFromString(text,'application/xml');
+        var trkpts=[].slice.call(xml.getElementsByTagName('trkpt')).map(function(n){
+          return L.latLng(parseFloat(n.getAttribute('lat')), parseFloat(n.getAttribute('lon')));
+        }).filter(function(ll){ return isFinite(ll.lat) && isFinite(ll.lng); });
+        if(trkpts.length) return trkpts;
+        var rtepts=[].slice.call(xml.getElementsByTagName('rtept')).map(function(n){
+          return L.latLng(parseFloat(n.getAttribute('lat')), parseFloat(n.getAttribute('lon')));
+        }).filter(function(ll){ return isFinite(ll.lat) && isFinite(ll.lng); });
+        return rtepts;
+      }catch(err){
+        return [];
+      }
+    }
+
+    gpxLoader.addEventListener('change', function(e){
+      var f=e.target.files && e.target.files[0];
+      if(!f) return;
+      var fr=new FileReader();
+      fr.onload=function(){
+        var coords=parseGpx(fr.result);
+        if(!coords.length){
+          alert('No GPX track or route points found.');
+          return;
+        }
+        if(gpxPolyline){ map.removeLayer(gpxPolyline); gpxPolyline=null; }
+        gpxPolyline=L.polyline(coords,{color:'#fffb00', weight:4, opacity:0.9});
+        gpxPolyline.addTo(map);
+        try{ gpxPolyline.bringToFront(); }catch(err){}
+        try{ map.fitBounds(gpxPolyline.getBounds(), {padding:[20,20]}); }catch(err){}
+        if(overlay && typeof overlay._reset==='function') overlay._reset();
+      };
+      fr.readAsText(f);
+    });
+
+    gpxClear.addEventListener('click', function(){
+      if(gpxPolyline){
+        map.removeLayer(gpxPolyline);
+        gpxPolyline=null;
+      }
+      gpxLoader.value='';
+    });
+    // --- Image load ---
+    imageLoader.addEventListener('change', function(e){
+      var f=e.target.files && e.target.files[0];
+      if(!f) return;
+      var r=new FileReader();
+      r.onload=function(ev){
+        image=new Image();
+        image.onload=function(){
+          resize();
+          var sx=canvas.width/image.width;
+          var sy=canvas.height/image.height;
+          scale=Math.min(sx,sy);
+          tx=(canvas.width-image.width*scale)/2;
+          ty=(canvas.height-image.height*scale)/2;
+          draw();
+          if(overlay && overlay._img){
+            overlay._img.src = image.src;
+            if (typeof overlay._reset==='function') overlay._reset();
+          }
+          calibStatus.textContent='Image loaded';
+          updateOverlay();
+        };
+        image.src=ev.target.result;
+      };
+      r.readAsDataURL(f);
+    });
+
+    // --- Points list ---
+    function renderPointList(residuals){
+      pointsDiv.innerHTML='';
+      for(var i=0;i<controlPoints.length;i++){
+        var p=controlPoints[i];
+        var r=(residuals && residuals[i]!=null)? residuals[i] : null;
+        var color='#9aa0a6';
+        if(r!=null){
+          if(r<=3) color='#5ad17a';
+          else if(r<=7) color='#e6a700';
+          else color='#ff5a5a';
+        }
+        var div=document.createElement('div');
+        div.className='row';
+        div.style.color=color;
+        div.textContent = '#'+(i+1)+' img=('+p.img.x.toFixed(1)+', '+p.img.y.toFixed(1)+') -> map=('
+          +p.ll.lat.toFixed(6)+', '+p.ll.lng.toFixed(6)+')'
+          +(r!=null? (' | res='+r.toFixed(2)+' m'):'');
+        pointsDiv.appendChild(div);
+      }
+    }
+
+    // --- KMZ export ---
+    exportBtn.addEventListener('click', async function(){
+      var model=computeModel();
+      if(!model){
+        alert('Add at least three control points first.');
+        return;
+      }
+      var cornerSets = projectCorners(model);
+      var kmzCorners = cornerSets ? cornerSets.kmz : null;
+      if(!kmzCorners){
+        alert('Unable to compute overlay corners.');
+        return;
+      }
+
+      var kml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+        + '<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">\n'
+        + '  <Folder>\n'
+        + '    <name>Georeferenced Map</name>\n'
+        + '    <GroundOverlay>\n'
+        + '      <name>map</name>\n'
+        + '      <Icon><href>files/map.png</href></Icon>\n'
+        + '      <gx:LatLonQuad>\n'
+        + '        <coordinates>\n'
+        + '          ' + kmzCorners.map(function(ll){ return ll.lng+"," + ll.lat + ",0"; }).join(' ') + '\n'
+        + '        </coordinates>\n'
+        + '      </gx:LatLonQuad>\n'
+        + '    </GroundOverlay>\n'
+        + '  </Folder>\n'
+        + '</kml>';
+
+      var zip = new JSZip();
+      var files = zip.folder('files');
+      zip.file('doc.kml', kml);
+      var blob = await (await fetch(image.src)).blob();
+      files.file('map.png', blob);
+      var out = await zip.generateAsync({type:'blob'});
+      saveAs(out,'georeferenced_map.kmz');
+    });
+  </script>
+</body>
+</html>
